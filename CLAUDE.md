@@ -2,7 +2,7 @@
 
 ## What This Is
 
-An autonomous system that discovers novel online bin packing heuristics. **You (Claude Code) are the brain.** You generate candidate packing heuristics, and Python scripts evaluate them for correctness, quality (bin efficiency), novelty, and simplicity.
+An autonomous system that discovers novel bin packing heuristics. **You (Claude Code) are the brain.** You generate candidate packing heuristics, and Python scripts evaluate them for correctness, quality (bin efficiency), novelty, and simplicity.
 
 ### Why Bin Packing?
 
@@ -25,107 +25,127 @@ uv run python harness.py evaluate candidates/candidate_001.py
 
 # If correct, attempt archive admission
 uv run python harness.py admit candidates/candidate_001.py \
-  --strategy anomaly_hunt --generation 1 --parents "best_fit+first_fit_decreasing"
+  --strategy anomaly_hunt --generation 1 --parents "best_fit+first_fit"
+
+# Analyze best heuristic's weaknesses
+uv run python harness.py red-team
+
+# Backfill behavioral signatures (run after code changes)
+uv run python harness.py backfill
 ```
 
 ## The Loop
 
 Each generation:
 
-1. **Run** `uv run python harness.py select-strategy` — returns JSON with strategy name, parent heuristic source code, and archive summary
-2. **Think** — use the strategy (see below) to design a genuinely novel packing heuristic
-3. **Write** the heuristic to `candidates/candidate_<gen>.py` — must define `def pack(items, capacity):` that returns a list of bins
-4. **Run** `uv run python harness.py evaluate candidates/candidate_<gen>.py` — returns correctness, quality, novelty, simplicity scores
-5. **If correct**, run `uv run python harness.py admit candidates/candidate_<gen>.py --strategy <name> --generation <N> --parents "<parent1>+<parent2>"`
-6. **Repeat** — pick up the next generation
+1. **Run** `uv run python harness.py select-strategy` — returns JSON with strategy name, parent source code, archive summary, **creativity prompt**, and **anti-convergence warnings**
+2. **Read the creativity prompt** — it contains research-backed techniques to avoid mode collapse
+3. **Think** — use the strategy AND the creativity prompt to design a genuinely novel heuristic
+4. **Write** the heuristic to `candidates/candidate_<gen>.py`
+5. **Run** `uv run python harness.py evaluate candidates/candidate_<gen>.py`
+6. **If correct**, run `uv run python harness.py admit candidates/candidate_<gen>.py --strategy <name> --generation <N> --parents "<parent1>+<parent2>"`
+7. **Repeat** — pick up the next generation
+
+### Using Red-Team Analysis
+
+Before designing new candidates, run `uv run python harness.py red-team` to see exactly WHERE and WHY the current best heuristic fails. This gives you specific distributions, arrival orders, bin counts, and fill patterns to target.
 
 ### Parallel Generation with Subagents
 
 For throughput, spawn **3 subagents in parallel** per generation batch, each with a different strategy. Give each subagent:
-- The strategy name and description
+- The strategy name, creativity prompt, and anti-convergence warnings
 - Parent heuristic source code (from select-strategy)
 - The archive summary
 - Instructions to write their candidate to a unique file
 
 Then evaluate all candidates sequentially (evaluation modifies archive state).
 
-## Heuristic Requirements
+## Online Heuristic Requirements
 
-Every candidate MUST:
-- Define `def pack(items, capacity):` as the entry point
-- Accept a list of floats (item sizes in (0, 1]) and a float capacity (1.0)
-- Return a list of bins, where each bin is a list of floats (the items in that bin)
-- Every item must appear in exactly one bin
+Every online candidate MUST:
+- Define `def create_packer(capacity):` that returns an object with:
+  - `place(item) -> int` — assign an item to a bin, return the bin index
+  - `get_bins() -> list[list[float]]` — return all bins with their contents
+- Items arrive one at a time via `place()` — NO lookahead, NO reordering
 - No bin's total may exceed capacity (with float tolerance)
-- Handle edge cases: empty list, single item, item equal to capacity
-- NOT use Python's built-in `sorted()` or `list.sort()` for the core packing decision (using them to pre-process items is fine)
-- Include any helper functions before or nested inside `pack()`
+- Handle edge cases: no items placed, single item, item equal to capacity
+- `place()` must return an integer bin index for each item
 
-### Example Output Format
+### Example Online Heuristic
 
 ```python
-# Input: items = [0.5, 0.3, 0.8, 0.2], capacity = 1.0
-# Valid output: [[0.5, 0.3, 0.2], [0.8]]
-# (two bins: first has 1.0 total, second has 0.8)
+def create_packer(capacity):
+    """Example: Best Fit — place item in fullest bin that still fits."""
+    class Packer:
+        def __init__(self):
+            self.bins = []
+            self.bin_sums = []
+
+        def place(self, item):
+            best_idx = -1
+            best_remaining = capacity + 1
+            for i in range(len(self.bins)):
+                remaining = capacity - self.bin_sums[i]
+                if item <= remaining + 1e-9 and remaining < best_remaining:
+                    best_remaining = remaining
+                    best_idx = i
+            if best_idx >= 0:
+                self.bins[best_idx].append(item)
+                self.bin_sums[best_idx] += item
+                return best_idx
+            self.bins.append([item])
+            self.bin_sums.append(item)
+            return len(self.bins) - 1
+
+        def get_bins(self):
+            return [list(b) for b in self.bins]
+
+    return Packer()
 ```
 
 ## Creativity Strategies
 
-When `select-strategy` returns a strategy, use these approaches:
+When `select-strategy` returns a strategy, use these approaches. **The `creativity_prompt` field in the JSON output contains specific research-backed instructions — follow them.**
 
 ### standard_mutation
-Take the parent heuristic and modify it — change the bin selection rule, the ordering, the data structures, or any other aspect. Make it pack more efficiently or handle certain distributions better.
+Take the parent heuristic and modify it — change the bin selection rule, the data structures, or any other aspect. **Verbalized sampling**: before coding, list 5 possible mutations with probability estimates. Develop the one you rate lowest probability.
 
 ### anomaly_hunt
-Look at the parent's performance profile table. Some distributions show very different efficiency. Ask: WHY does it waste bins on that distribution? What structural property of those items causes poor packing? Design a NEW heuristic that exploits whatever you discover.
+Look at the parent's performance profile table. Some distributions show very different efficiency. Ask: WHY does it waste bins on that distribution? **Use 5-Whys root cause analysis**: don't stop at "it wastes space" — ask WHY five times.
 
 ### cross_domain
-You get TWO parent heuristics with very different strategies. Find the deeper idea in each and merge them into a single unified approach. Do NOT simply run one then the other — create a genuinely hybrid mechanism.
+You get TWO parent heuristics with very different strategies. **Analogical mapping**: identify the ABSTRACT PRINCIPLE behind each parent (not its code). Synthesize a new principle that neither parent embodies alone.
 
 ### first_principles
-Ignore all known packing heuristics. Reason from fundamentals:
-- You have items with sizes in (0, 1]
-- You need to assign each to a bin so no bin exceeds capacity 1.0
-- You want to minimize the number of bins
-- The sum of items / capacity gives a hard lower bound
-- Items that pair well (sum close to 1.0) should share bins
-Think about what mathematical properties of item distributions are unexploited.
+Ignore all known packing heuristics. Reason from fundamentals. **Constraint relaxation**: list 5 implicit assumptions ALL bin packing heuristics make. Violate at least 2. What algorithm emerges?
 
 ### constraint_inject
-Design a packing heuristic under an artificial constraint:
-- No sorting of items allowed (pure online)
-- O(1) extra space — can only track fixed number of open bins
-- No floating point comparisons (only integer arithmetic after scaling)
-- Items must be processed in a single pass with no lookahead
-- Maximum 3 open bins at any time
-- No explicit bin tracking — use mathematical placement rules
-
-Pick one constraint, or use the one provided by select-strategy.
+Design a heuristic under an artificial constraint (e.g., max 3 open bins, no floating point, single pass). The constraint forces discovery of structures unconstrained algorithms would never find.
 
 ### distribution_aware
-Design heuristics that detect properties of the item stream and adapt:
-- Measure the distribution of item sizes seen so far
-- Track statistics (mean, variance, histogram buckets)
-- Switch between sub-strategies based on detected distribution type
-- Use prediction of future items based on past items
-This is where real-world competitive advantage lives.
+Design heuristics that detect properties of the item stream and adapt. **Prediction-driven**: don't just detect the distribution — predict what items will arrive next.
 
 ### outsider_perspective
-Think as a non-CS practitioner:
-- WAREHOUSE MANAGER: spatial intuition, heavy things first, fill gaps
-- TETRIS PLAYER: look for complementary shapes, avoid creating gaps
-- CHEF: group ingredients by recipe, fill containers to the brim
-- POSTAL WORKER: weight limits per bag, heavy parcels first, fill with letters
-- ACCOUNTANT: maximize utilization rate per bin, track waste percentage
+**Research shows ordinary personas beat celebrity personas for creativity.** Think as a specific non-expert: a kindergarten teacher, a Tetris speedrunner, a postal worker who's sorted mail for 30 years.
 
 ### novelty_search
-Your ONLY goal is maximum structural difference from everything in the archive. It doesn't need to be efficient — just CORRECT and DIFFERENT. Use data structures, control flow, or mathematical properties nobody has tried.
+Your ONLY goal is maximum structural AND behavioral difference from everything in the archive. Use programming constructs nobody has tried.
+
+## Anti-Convergence Rules
+
+**CRITICAL: Read these before every generation.**
+
+1. If the archive has > 5 members with quality > 0.90, DO NOT generate another simple Best Fit/First Fit variant
+2. If your candidate is structurally similar to existing archive members, focus on behavioral novelty
+3. Quality 0.88 with genuine behavioral novelty is MORE VALUABLE than quality 0.92 without any
+4. The `select-strategy` output includes an `anti_convergence` field listing over-represented patterns. AVOID these patterns.
+5. Before coding, ask: "Would a CS professor look at this and say 'that's obvious'?" If yes, make it weirder.
 
 ## Scoring
 
 - **Correctness**: Must pack all items into valid bins across 200+ test cases. Binary gate — fail this and nothing else matters.
-- **Quality**: Ratio of lower_bound / bins_used across 10 distributions × 3 sizes. Score 0-1 (1.0 = matches optimal packing).
-- **Novelty**: AST structural distance × behavioral distance vs all archive members. Score 0-1.
+- **Quality**: Ratio of lower_bound / bins_used across distributions × sizes (× arrival orders for online). Score 0-1.
+- **Novelty**: Combines AST structural distance and behavioral distance. Behavioral distance uses a rich 864-element signature capturing bin fill distributions, waste patterns, and item co-location.
 - **Simplicity**: Based on LOC, cyclomatic complexity, nesting depth. Score 0-1.
 - **Combined**: quality × novelty × (0.7 + 0.3 × simplicity). This determines admission.
 
@@ -133,8 +153,32 @@ Your ONLY goal is maximum structural difference from everything in the archive. 
 
 A candidate gets in if ANY of these hold:
 1. **Pareto improvement** — not dominated on quality/novelty/simplicity by any existing member, AND dominates at least one
-2. **Behavioral niche** — performance profile is sufficiently different from all existing members (cosine distance > 0.15)
-3. **Structural niche** — AST structure is sufficiently different from all existing members (edit distance > 0.3)
+2. **Behavioral niche** — behavioral signature is sufficiently different (Euclidean distance > 0.05). This measures HOW you pack, not just how well.
+3. **Structural niche** — AST structure is sufficiently different (edit distance > 0.3)
+
+## Online Evaluation Details
+
+Online heuristics are tested across:
+- **8 distributions**: uniform_small, uniform_medium, uniform_large, uniform_full, bimodal, trimodal, heavy_tail, thirds
+- **4 arrival orders**: random, increasing, decreasing, oscillating
+- **3 sizes**: 50, 200, 1000 items
+
+Total: 96 test cases per evaluation. Arrival order matters hugely — a heuristic that excels on decreasing order may fail badly on increasing.
+
+### Key Online Challenges
+
+- **No sorting**: You can't sort items — they arrive in whatever order
+- **Increasing order** is the hardest: small items arrive first, get packed suboptimally, then large items can't pair with them
+- **Oscillating order** alternates large/small — tests whether you can pair them in real-time
+- **State management**: What statistics do you track about items seen so far?
+- **Reservation**: Should you keep bins partially filled hoping for a good complement?
+
+### Competitive Ratio Targets
+
+- Next Fit: ~2.0 (worst canonical, easiest to beat)
+- First Fit / Best Fit: ~1.7 (strong baselines)
+- Harmonic: ~1.69 (theoretical near-optimal for worst case)
+- **Target**: Find heuristics that beat Best Fit on average across distributions while maintaining correctness
 
 ## Distributions Tested
 
@@ -147,43 +191,14 @@ A candidate gets in if ANY of these hold:
 | bimodal | Small (0.05-0.20) or large (0.60-0.90) | Pairing small+large is critical |
 | trimodal | Three clusters | Complex pairing across three groups |
 | heavy_tail | Pareto-distributed | Rare huge items, many tiny ones |
-| decreasing | 0.99 down to 0.01 | Arrival order matches FFD's ideal |
-| increasing | 0.01 up to 0.99 | Worst case for greedy — small items arrive first, waste space |
 | thirds | Items all ~0.30 | Exactly 3 fit per bin — precision matters |
 
-## Benchmarking Against Standard Instances
+## Tips for Generating Good Online Candidates
 
-After discovering heuristics, benchmark them against OR-Library instances (the same benchmark FunSearch used):
-
-```bash
-# Quick test (OR1 only, ~20 problems)
-uv run python benchmark.py --quick
-
-# Full benchmark (all 8 datasets, 160 problems)
-uv run python benchmark.py
-
-# Benchmark a specific candidate
-uv run python benchmark.py candidates/candidate_042.py
-
-# Uniform instances only (OR1-4, items in [20,100], capacity 150)
-uv run python benchmark.py --uniform
-
-# Triplet instances only (OR5-8, items in [25,50], capacity 100)
-uv run python benchmark.py --triplet
-
-# JSON output for programmatic use
-uv run python benchmark.py --json
-```
-
-Results show **excess bins % vs known optimal** — lower is better. FunSearch beat Best Fit on these instances; that's our target.
-
-## Tips for Generating Good Candidates
-
-- Think about **item pairing**: which items sum close to capacity? How can you find good pairs efficiently?
-- Think about **reservation**: should you keep some bins partially filled waiting for a good complement?
-- Think about **thresholds**: items > 0.5 can never share a bin — handle them specially
-- Think about **lookahead**: if you can see all items, how does that change the strategy?
-- The **increasing** distribution is where most heuristics struggle — small items arrive first and get packed suboptimally
-- **Adaptive** approaches that detect the distribution tend to score well on quality
-- Very simple heuristics that find a behavioral niche tend to get admitted even if suboptimal
-- Check the archive summary — if everything is greedy, try a mathematical/statistical approach
+- **Track running statistics**: mean, variance, distribution shape of items seen so far
+- **Reservation strategy**: keep some bins partially filled waiting for good complements
+- **Size classes**: handle items > 0.5 specially (they can never share a bin with another > 0.5)
+- **Adaptive thresholds**: change behavior based on how many items you've seen
+- **The increasing distribution** is where most heuristics struggle — design for this case
+- **Pair complementary items**: if you see a 0.3, anticipate a 0.7 coming later
+- **Run red-team analysis** before designing to know exactly where to aim

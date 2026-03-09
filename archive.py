@@ -12,7 +12,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from novelty import _cosine_distance, ast_novelty
+from novelty import _cosine_distance, _euclidean_distance, ast_novelty
 
 
 # ---------------------------------------------------------------------------
@@ -25,6 +25,7 @@ class ArchiveEntry:
     source: str
     scores: dict
     profile: list
+    behavioral_signature: list = field(default_factory=list)
     parents: list = field(default_factory=list)
     strategy: str = ""
     generation: int = 0
@@ -36,6 +37,7 @@ class ArchiveEntry:
             "name": self.name,
             "scores": self.scores,
             "profile": self.profile,
+            "behavioral_signature": self.behavioral_signature,
             "parents": self.parents,
             "strategy": self.strategy,
             "generation": self.generation,
@@ -50,6 +52,7 @@ class ArchiveEntry:
             source=source,
             scores=d.get("scores", {}),
             profile=d.get("profile", []),
+            behavioral_signature=d.get("behavioral_signature", []),
             parents=d.get("parents", []),
             strategy=d.get("strategy", ""),
             generation=d.get("generation", 0),
@@ -63,7 +66,7 @@ class ArchiveEntry:
 # ---------------------------------------------------------------------------
 
 ARCHIVE_MAX_SIZE = 100
-BEHAVIORAL_NICHE_THRESHOLD = 0.15
+BEHAVIORAL_NICHE_THRESHOLD = 0.05  # Euclidean distance on 270-element behavioral signatures
 STRUCTURAL_NICHE_THRESHOLD = 0.3
 
 
@@ -87,6 +90,10 @@ class Archive:
     def get_all_profiles(self):
         return [a.profile for a in self.algorithms.values() if a.profile]
 
+    def get_all_behavioral_signatures(self):
+        return [a.behavioral_signature for a in self.algorithms.values()
+                if a.behavioral_signature]
+
     def get_all_entries(self):
         return list(self.algorithms.values())
 
@@ -95,29 +102,39 @@ class Archive:
 
     # ----- Seeding -----
 
-    def seed_canonical(self, canonical_dir):
-        """Load canonical bin packing heuristics from a directory."""
+    def seed_canonical(self, canonical_dir, extract_fn=None, correctness_fn=None,
+                       quality_fn=None, simplicity_fn=None):
+        """Load canonical bin packing heuristics from a directory.
+
+        For online track, pass the evaluator functions from evaluate_online.
+        Defaults to offline evaluator functions from evaluate.py.
+        """
         canonical_dir = Path(canonical_dir)
         if not canonical_dir.exists():
             return
 
-        from evaluate import evaluate_correctness, evaluate_quality, simplicity_score, extract_and_compile
+        if extract_fn is None:
+            from evaluate import evaluate_correctness, evaluate_quality, simplicity_score, extract_and_compile
+            extract_fn = extract_and_compile
+            correctness_fn = evaluate_correctness
+            quality_fn = evaluate_quality
+            simplicity_fn = simplicity_score
 
         for py_file in sorted(canonical_dir.glob("*.py")):
             source = py_file.read_text()
             name = py_file.stem
 
-            pack_fn = extract_and_compile(source)
+            pack_fn = extract_fn(source)
             if pack_fn is None:
                 print(f"  SKIP {name}: failed to compile")
                 continue
 
-            if not evaluate_correctness(pack_fn, trials=100):
+            if not correctness_fn(pack_fn, trials=100):
                 print(f"  SKIP {name}: failed correctness")
                 continue
 
-            quality, profile = evaluate_quality(pack_fn)
-            simpl = simplicity_score(source)
+            quality, profile, beh_sig = quality_fn(pack_fn)
+            simpl = simplicity_fn(source)
 
             entry = ArchiveEntry(
                 name=name,
@@ -130,6 +147,7 @@ class Archive:
                     "combined": 0.0,
                 },
                 profile=profile,
+                behavioral_signature=beh_sig,
                 is_canonical=True,
             )
             self.algorithms[name] = entry
@@ -140,14 +158,25 @@ class Archive:
     def try_admit(self, source_code, scores, parents, strategy, generation, reasoning=""):
         """Admit if the candidate increases archive diversity or is Pareto-improving."""
         profile = scores.get("profile", [])
+        beh_sig = scores.get("behavioral_signature", [])
 
         # Condition 1: Pareto improvement
         if self._is_pareto_improvement(scores):
             self._admit(source_code, scores, parents, strategy, generation, reasoning)
             return True
 
-        # Condition 2: Behavioral niche
-        if profile and self.get_all_profiles():
+        # Condition 2: Behavioral niche (rich signatures with Euclidean distance)
+        if beh_sig:
+            arch_sigs = [a.behavioral_signature for a in self.algorithms.values()
+                         if a.behavioral_signature and len(a.behavioral_signature) == len(beh_sig)]
+            if arch_sigs:
+                min_dist = min(_euclidean_distance(beh_sig, s) for s in arch_sigs)
+                if min_dist > BEHAVIORAL_NICHE_THRESHOLD:
+                    self._admit(source_code, scores, parents, strategy, generation, reasoning)
+                    return True
+
+        # Condition 2b: Legacy behavioral niche (cosine on profiles, for old entries)
+        if not beh_sig and profile and self.get_all_profiles():
             min_behavioral_dist = min(
                 _cosine_distance(profile, a.profile)
                 for a in self.algorithms.values()
@@ -201,6 +230,7 @@ class Archive:
             source=source_code,
             scores=scores,
             profile=scores.get("profile", []),
+            behavioral_signature=scores.get("behavioral_signature", []),
             parents=parent_names,
             strategy=strategy,
             generation=generation,
@@ -232,25 +262,31 @@ class Archive:
     def _diversity_loss_if_removed(self, name):
         """How much diversity is lost if we remove this algorithm?"""
         algo = self.algorithms[name]
-        if not algo.profile:
-            return 0.0
 
         total = 0.0
         for other_name, other in self.algorithms.items():
-            if other_name == name or not other.profile:
+            if other_name == name:
                 continue
-            total += _cosine_distance(algo.profile, other.profile)
+            # Prefer behavioral signature distance, fall back to profile cosine
+            if algo.behavioral_signature and other.behavioral_signature:
+                total += _euclidean_distance(algo.behavioral_signature,
+                                             other.behavioral_signature)
+            elif algo.profile and other.profile:
+                total += _cosine_distance(algo.profile, other.profile)
         return total
 
     # ----- Persistence -----
 
-    def save(self, base_dir):
+    def save(self, base_dir, track="offline"):
         """Save archive state to disk."""
         base_dir = Path(base_dir)
-        discovered_dir = base_dir / "discovered"
-        profiles_dir = base_dir / "profiles"
+        prefix = "online_" if track == "online" else ""
+        discovered_dir = base_dir / f"{prefix}discovered"
+        profiles_dir = base_dir / f"{prefix}profiles"
+        signatures_dir = base_dir / f"{prefix}signatures"
         discovered_dir.mkdir(parents=True, exist_ok=True)
         profiles_dir.mkdir(parents=True, exist_ok=True)
+        signatures_dir.mkdir(parents=True, exist_ok=True)
 
         state = {}
         for name, entry in self.algorithms.items():
@@ -264,15 +300,21 @@ class Archive:
                     json.dumps(entry.profile)
                 )
 
-        (base_dir / "archive_state.json").write_text(
+            if entry.behavioral_signature:
+                (signatures_dir / f"{name}.json").write_text(
+                    json.dumps(entry.behavioral_signature)
+                )
+
+        (base_dir / f"{prefix}archive_state.json").write_text(
             json.dumps(state, indent=2)
         )
 
     @classmethod
-    def load_or_create(cls, base_dir):
+    def load_or_create(cls, base_dir, track="offline"):
         """Load archive from disk or create a new one."""
         base_dir = Path(base_dir)
-        state_file = base_dir / "archive_state.json"
+        prefix = "online_" if track == "online" else ""
+        state_file = base_dir / f"{prefix}archive_state.json"
 
         archive = cls()
 
@@ -284,8 +326,8 @@ class Archive:
         except (json.JSONDecodeError, OSError):
             return archive
 
-        canonical_dir = base_dir / "canonical"
-        discovered_dir = base_dir / "discovered"
+        canonical_dir = base_dir / f"{prefix}canonical"
+        discovered_dir = base_dir / f"{prefix}discovered"
 
         for name, data in state.items():
             if data.get("is_canonical"):
@@ -297,7 +339,7 @@ class Archive:
             if source_file.exists():
                 source = source_file.read_text()
 
-            profile_file = base_dir / "profiles" / f"{name}.json"
+            profile_file = base_dir / f"{prefix}profiles" / f"{name}.json"
             profile = data.get("profile", [])
             if not profile and profile_file.exists():
                 try:
@@ -305,7 +347,16 @@ class Archive:
                 except (json.JSONDecodeError, OSError):
                     pass
 
+            sig_file = base_dir / f"{prefix}signatures" / f"{name}.json"
+            beh_sig = data.get("behavioral_signature", [])
+            if not beh_sig and sig_file.exists():
+                try:
+                    beh_sig = json.loads(sig_file.read_text())
+                except (json.JSONDecodeError, OSError):
+                    pass
+
             data["profile"] = profile
+            data["behavioral_signature"] = beh_sig
             entry = ArchiveEntry.from_dict(data, source=source)
             archive.algorithms[name] = entry
 

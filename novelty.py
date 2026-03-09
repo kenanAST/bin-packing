@@ -3,7 +3,10 @@ Novelty measurement for bin packing heuristic candidates.
 
 Two dimensions:
   - AST structural novelty (how different is the code?)
-  - Behavioral novelty (how different is the performance profile?)
+  - Behavioral novelty (how different is the packing behavior?)
+
+Behavioral novelty uses a rich 270-element signature capturing bin fill
+distributions, waste patterns, and item co-location — not just quality ratios.
 """
 
 import ast
@@ -95,11 +98,12 @@ def ast_novelty(candidate_source, archive_sources):
 
 
 # ---------------------------------------------------------------------------
-# Behavioral novelty (performance profile distance)
+# Behavioral novelty (rich behavioral signature distance)
 # ---------------------------------------------------------------------------
 
 def _cosine_distance(vec_a, vec_b):
-    """Cosine distance between two vectors. Returns float in [0, 1]."""
+    """Cosine distance between two vectors. Returns float in [0, 1].
+    Legacy metric — kept for backward compatibility with old profiles."""
     if len(vec_a) != len(vec_b) or len(vec_a) == 0:
         return 1.0
 
@@ -115,20 +119,45 @@ def _cosine_distance(vec_a, vec_b):
     return (1.0 - similarity) / 2.0
 
 
-def behavioral_novelty(candidate_profile, archive_profiles):
+def _euclidean_distance(sig_a, sig_b):
+    """Euclidean distance on behavioral signatures, normalized to [0, 1].
+
+    Unlike cosine distance on near-unit quality ratio vectors, Euclidean
+    distance on rich behavioral signatures (bin fill distributions, waste
+    patterns, co-location ratios) captures genuine behavioral differences.
+    """
+    if len(sig_a) != len(sig_b) or len(sig_a) == 0:
+        return 1.0
+
+    sq_sum = sum((a - b) ** 2 for a, b in zip(sig_a, sig_b))
+    # Normalize: sqrt(mean squared diff). Each element is in [0, 1],
+    # so max possible distance is 1.0 (all elements differ maximally).
+    raw = math.sqrt(sq_sum / len(sig_a))
+    return min(raw, 1.0)
+
+
+def behavioral_novelty(candidate_sig, archive_sigs, candidate_profile=None, archive_profiles=None):
     """
     How different does this heuristic behave from everything in the archive?
     Returns float in [0, 1]. Higher = more novel.
+
+    Uses rich behavioral signatures (Euclidean distance) as primary metric.
+    Falls back to legacy cosine distance on quality profiles if signatures
+    are not available.
     """
-    if not archive_profiles:
-        return 1.0
+    # Primary: Euclidean distance on rich behavioral signatures
+    if candidate_sig and archive_sigs:
+        valid_sigs = [s for s in archive_sigs if s and len(s) == len(candidate_sig)]
+        if valid_sigs:
+            distances = [_euclidean_distance(candidate_sig, s) for s in valid_sigs]
+            return min(distances)
 
-    distances = []
-    for arch_profile in archive_profiles:
-        dist = _cosine_distance(candidate_profile, arch_profile)
-        distances.append(dist)
+    # Fallback: cosine distance on quality ratio profiles (legacy)
+    if candidate_profile and archive_profiles:
+        distances = [_cosine_distance(candidate_profile, p) for p in archive_profiles]
+        return min(distances)
 
-    return min(distances)
+    return 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -136,5 +165,12 @@ def behavioral_novelty(candidate_profile, archive_profiles):
 # ---------------------------------------------------------------------------
 
 def novelty_score(ast_nov, behavioral_nov):
-    """Novelty requires BOTH structural AND behavioral difference."""
-    return (ast_nov * behavioral_nov) ** 0.5
+    """Novelty combines structural AND behavioral difference.
+
+    Uses max(geometric_mean, behavioral) so that high behavioral novelty
+    alone can contribute, rather than being zeroed out by the product.
+    """
+    geo = (ast_nov * behavioral_nov) ** 0.5
+    # Give behavioral novelty a floor proportional to AST novelty,
+    # so structurally unique code that behaves slightly differently still scores
+    return max(geo, behavioral_nov * 0.8)
