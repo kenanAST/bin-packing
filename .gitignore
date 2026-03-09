@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+candidates/
+archive/discovered/
+archive/profiles/
+archive/archive_state.json
+results.tsv
+strategy_stats.json
