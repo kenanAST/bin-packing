@@ -7,3 +7,4 @@ archive/profiles/
 archive/archive_state.json
 results.tsv
 strategy_stats.json
+bench_data/

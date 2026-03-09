@@ -151,6 +151,32 @@ A candidate gets in if ANY of these hold:
 | increasing | 0.01 up to 0.99 | Worst case for greedy — small items arrive first, waste space |
 | thirds | Items all ~0.30 | Exactly 3 fit per bin — precision matters |
 
+## Benchmarking Against Standard Instances
+
+After discovering heuristics, benchmark them against OR-Library instances (the same benchmark FunSearch used):
+
+```bash
+# Quick test (OR1 only, ~20 problems)
+uv run python benchmark.py --quick
+
+# Full benchmark (all 8 datasets, 160 problems)
+uv run python benchmark.py
+
+# Benchmark a specific candidate
+uv run python benchmark.py candidates/candidate_042.py
+
+# Uniform instances only (OR1-4, items in [20,100], capacity 150)
+uv run python benchmark.py --uniform
+
+# Triplet instances only (OR5-8, items in [25,50], capacity 100)
+uv run python benchmark.py --triplet
+
+# JSON output for programmatic use
+uv run python benchmark.py --json
+```
+
+Results show **excess bins % vs known optimal** — lower is better. FunSearch beat Best Fit on these instances; that's our target.
+
 ## Tips for Generating Good Candidates
 
 - Think about **item pairing**: which items sum close to capacity? How can you find good pairs efficiently?
